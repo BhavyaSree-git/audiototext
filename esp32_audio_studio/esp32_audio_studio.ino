@@ -9,10 +9,15 @@
 #include <WiFi.h>
 #include "driver/i2s.h"
 
+// Wi-Fi settings are kept in this sketch so Arduino IDE can compile and upload
+// this folder directly. Replace both values before uploading. Do not use an
+// enterprise/captive-portal Wi-Fi network because it may block mDNS.
+static const char *WIFI_SSID = "YOUR_WIFI_NAME";
+static const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
 // Tested pin assumptions from the supplied sketch: original ESP32 DevKit,
 // two I2S controllers, four INMP441 microphones, and an SPI SD-card module.
 // On each I2S bus, strap one microphone L/R select low and the other high.
-#include "wifi_config.h"
 static constexpr char MDNS_HOST[] = "esp32";
 
 static constexpr int SD_CS = 5;
