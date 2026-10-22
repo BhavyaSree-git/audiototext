@@ -1,0 +1,9 @@
+.venv/
+.models/
+.transcripts/
+__pycache__/
+*.log
+wifi_config.h
+.env
+.env.*
+!.env.example
