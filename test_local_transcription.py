@@ -13,13 +13,17 @@ class LocalTranscriptionTests(unittest.TestCase):
         jobs = TranscriptionJobs(SimpleNamespace(resolve=lambda: "192.168.1.2"))
         jobs.jobs["test"] = {"status": "queued"}
         jobs.active["recording.wav"] = "test"
-        jobs.model = SimpleNamespace(transcribe=lambda *a, **k: (iter(segments), SimpleNamespace(duration=60)))
+        jobs.model = SimpleNamespace(transcribe=lambda *a, **k: (iter(segments), SimpleNamespace(duration=60, language="kn", language_probability=.9)))
         audio = b"test audio bytes"
         response = io.BytesIO(audio)
         response.status = download_status
         response.getheader = lambda key: str(len(audio))
         connection = SimpleNamespace(request=lambda *a, **k: None, getresponse=lambda: response, close=lambda: None)
-        with patch("local_transcription.ROOT", Path(cache_dir)), patch("local_transcription.http.client.HTTPConnection", return_value=connection):
+        def prepare(source, raw, clear):
+            raw.write_bytes(b"raw")
+            clear.write_bytes(b"clear")
+            return [], {"speechSeconds": 10, "channels": 4, "selectedChannel": 2}
+        with patch("local_transcription.prepare_audio", side_effect=prepare), patch("local_transcription.ROOT", Path(cache_dir)), patch("local_transcription.http.client.HTTPConnection", return_value=connection):
             jobs.run("test", "recording.wav")
         jobs.executor.shutdown()
         self.assertFalse(jobs.active)
@@ -27,7 +31,7 @@ class LocalTranscriptionTests(unittest.TestCase):
 
     def test_complete_audio_and_persistent_cache(self):
         with tempfile.TemporaryDirectory() as directory:
-            segments = [SimpleNamespace(text="first", end=30), SimpleNamespace(text="last", end=60)]
+            segments = [SimpleNamespace(text="first", start=0, end=30, avg_logprob=-.2, no_speech_prob=.01, compression_ratio=1), SimpleNamespace(text="last", start=30, end=60, avg_logprob=-.2, no_speech_prob=.01, compression_ratio=1)]
             result = self.run_job(segments, directory)
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["text"], "first last")
@@ -38,7 +42,15 @@ class LocalTranscriptionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_job([], directory)
             self.assertEqual(result["status"], "failed")
-            self.assertIn("no speech", result["error"])
+            self.assertIn("reliably", result["error"])
+
+    def test_unreliable_speech_is_not_saved_as_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            segment = SimpleNamespace(text="invented text", start=0, end=10, avg_logprob=-2, no_speech_prob=.9, compression_ratio=4)
+            result = self.run_job([segment], directory)
+            self.assertEqual(result["status"], "failed")
+            self.assertNotIn("text", result)
+            self.assertIn("audio", result)
 
     def test_download_failure(self):
         with tempfile.TemporaryDirectory() as directory:

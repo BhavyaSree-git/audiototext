@@ -21,6 +21,8 @@
     transcriptions: new Map(),
     transcribing: new Map(),
     latestFile: null,
+    selection: 0,
+    controlBusy: false,
     page: "overview",
     deviceInfo: null
   };
@@ -32,12 +34,12 @@
     window.scrollTo(0, 0);
   }
 
-  async function waitForTranscript(jobId) {
+  async function waitForTranscript(jobId, onProgress = () => {}) {
     const deadline = Date.now() + 60 * 60 * 1000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => window.setTimeout(resolve, 3000));
       const result = await apiRequest(`/api/transcriptions/${encodeURIComponent(jobId)}`);
-      if (result?.message) setLatestStatus(result.message, "working");
+      onProgress(result);
       if (result?.status === "completed") return result;
       if (result?.status === "failed") {
         throw new Error(result.error || "The transcription service could not process this recording.");
@@ -54,7 +56,7 @@
     item.className = `toast${isError ? " error" : ""}`;
     item.textContent = message;
     $("#toast-region").append(item);
-    window.setTimeout(() => item.remove(), 4200);
+    window.setTimeout(() => item.remove(), isError ? 12000 : 6500);
   }
 
   function setConnected(connected, info = null) {
@@ -84,19 +86,15 @@
       : `Connect to esp32.local to see your SD card and control your device.`;
     $("#stop-save-record").disabled = !connected || (!state.recording && !state.recordingPendingSave);
     $("#stop-save-record").querySelector("span").textContent = state.recordingPendingSave ? "Retry save" : "Stop & save";
-    $("#start-record").disabled = !connected || state.recording || state.recordingPendingSave;
+    $("#start-record").disabled = !connected || state.recording || state.recordingPendingSave || info?.sdReady === false || info?.i2sReady === false;
     $("#control-note").textContent = connected
       ? "Use the device controls to capture a new audio file."
       : "Connect your ESP32 to enable recording controls.";
   }
 
   function updateFiles(files) {
-    state.files = Array.isArray(files) ? files.slice() : [];
-    state.files.sort((left, right) => {
-      const leftDate = Date.parse(left.createdAt || left.date || "");
-      const rightDate = Date.parse(right.createdAt || right.date || "");
-      return Number.isFinite(leftDate) && Number.isFinite(rightDate) ? rightDate - leftDate : 0;
-    });
+    state.files = Array.isArray(files) ? files.filter(file => !file.name.startsWith("._")) : [];
+    /* The device supplies newest first, including its last saved/uploaded file. */
     $("#stat-recordings").textContent = String(state.files.length);
     $("#nav-count").textContent = String(state.files.length);
     $("#library-count").textContent = String(state.files.length);
@@ -112,8 +110,6 @@
       : "connect to see storage";
 
     state.files.forEach((file, index) => {
-      const savedText = file.transcriptText || file.transcript || state.transcriptions.get(file.name);
-      if (typeof savedText === "string" && savedText.trim()) state.transcriptions.set(file.name, savedText);
       const row = makeFileRow(file, index);
       libraryFiles.append(row);
       if (index < 3) recentFiles.append(makeFileRow(file, index, true));
@@ -172,7 +168,7 @@
     type.className = "file-type";
     type.textContent = `${file.name?.split(".").pop()?.toUpperCase() || "AUDIO"} · SD CARD`;
     textWrap.append(type);
-    if (state.transcriptions.has(file.name) || file.transcriptText || file.transcript) {
+    if (state.transcriptions.has(`${file.name}:${file.size}`)) {
       type.textContent += " · CONVERTED";
     }
     name.append(icon, textWrap);
@@ -181,8 +177,7 @@
     const actionsCell = document.createElement("td");
     const actions = document.createElement("span");
     actions.className = "row-actions";
-    const converted = state.transcriptions.has(file.name) || file.transcriptText || file.transcript;
-    const transcribe = actionButton("i-text", converted ? "View text" : "Convert", "transcribe-action");
+    const transcribe = actionButton("i-text", "Convert", "transcribe-action");
     transcribe.addEventListener("click", () => transcribeFile(file, index));
     const download = actionButton("i-download", "Download", "");
     download.addEventListener("click", () => downloadFile(file));
@@ -265,10 +260,15 @@
       }
       reachedDevice = true;
       setConnected(true, info);
+      if (info.recording) {
+        beginRecordingDisplay();
+        toast("ESP32 is already recording. Use Stop & save to finish.");
+        return;
+      }
       const data = await apiRequest("/api/files");
       updateFiles(Array.isArray(data) ? data : data?.files);
-      await autoTranscribeLatest();
-      toast("Device connected and SD card synced.");
+      toast(`Connected to esp32.local. ${state.files.length} audio file(s) loaded from the SD card.`);
+      void autoTranscribeLatest();
     } catch (error) {
       if (!reachedDevice) setConnected(false);
       updateFiles([]);
@@ -296,18 +296,15 @@
     }
   }
 
-  async function startRecording() {
-    if (state.recordingPendingSave) {
-      toast("Save the stopped recording before starting another one.", true);
-      return;
-    }
-    if (!(await deviceCommand("/api/record/start", "Recording started."))) return;
+  function beginRecordingDisplay() {
     state.recording = true;
     state.recordingPendingSave = false;
-    state.recordingStartedAt = Date.now();
+    state.recordingStartedAt = Date.now() - (state.deviceInfo?.recordingMs || 0);
+    state.elapsedBeforePause = 0;
+    window.clearInterval(state.timer);
     $("#recording-tag").classList.add("recording");
     $("#recording-tag").innerHTML = "<i></i> RECORDING";
-    $("#recording-help").textContent = "Take your time. Every word is being captured.";
+    $("#recording-help").textContent = "ESP32 is recording to the SD card. LED: green.";
     $("#sidebar-status-dot").classList.add("recording");
     $("#start-record").disabled = true;
     $("#stop-save-record").disabled = false;
@@ -315,6 +312,27 @@
     $("#recording-visual").parentElement.classList.add("is-recording");
     state.timer = window.setInterval(updateRecordingTimer, 1000);
     updateRecordingTimer();
+  }
+
+  async function startRecording() {
+    if (state.controlBusy || state.recording) return;
+    if (!state.connected || state.recordingPendingSave) {
+      toast(state.recordingPendingSave ? "Save the stopped recording first." : "Connect the ESP32 first.", true);
+      return;
+    }
+    state.controlBusy = true;
+    $("#start-record").disabled = true;
+    try {
+      const result = await apiRequest("/api/record/start", { method: "POST" });
+      if (!result?.recording) throw new Error("ESP32 did not confirm that recording started.");
+      beginRecordingDisplay();
+      toast(`Recording started on ESP32${result.file ? `: ${result.file}` : ""}.`);
+    } catch (error) {
+      toast(`Recording did not start: ${error.message}`, true);
+      $("#start-record").disabled = !state.connected;
+    } finally {
+      state.controlBusy = false;
+    }
   }
 
   function updateRecordingTimer() {
@@ -326,13 +344,18 @@
   }
 
   async function stopAndSaveRecording() {
+    if (state.controlBusy || (!state.recording && !state.recordingPendingSave)) return;
+    state.controlBusy = true;
+    let savedFileName = null;
     const button = $("#stop-save-record");
     button.disabled = true;
     if (state.recording) {
       try {
-        await apiRequest("/api/record/stop", { method: "POST" });
+        const stopped = await apiRequest("/api/record/stop", { method: "POST" });
+        if (stopped?.recording !== false) throw new Error("ESP32 did not confirm that recording stopped.");
       } catch (error) {
         button.disabled = false;
+        state.controlBusy = false;
         toast(`Could not stop recording: ${error.message}`, true);
         return;
       }
@@ -343,7 +366,9 @@
       $("#sidebar-status-dot").classList.remove("recording");
     }
     try {
-      await apiRequest("/api/record/save", { method: "POST" });
+      const saved = await apiRequest("/api/record/save", { method: "POST" });
+      if (!saved?.saved || !saved.file) throw new Error("ESP32 did not confirm a saved filename.");
+      savedFileName = saved.file;
     } catch (error) {
       button.disabled = false;
       button.querySelector("span").textContent = "Retry save";
@@ -351,13 +376,14 @@
       $("#recording-tag").innerHTML = "<i></i> SAVE FAILED";
       $("#recording-help").textContent = "Recording stopped but could not be saved. Retry to save it.";
       $("#start-record").disabled = true;
+      state.controlBusy = false;
       toast(`Recording stopped but could not be saved: ${error.message}`, true);
       return;
     }
     state.recordingPendingSave = false;
     $("#recording-tag").classList.remove("recording");
     $("#recording-tag").innerHTML = "<i></i> READY";
-    $("#recording-help").textContent = "Saved. Converting your latest recording to Kannada.";
+    $("#recording-help").textContent = "Saved to the SD card. Preparing playback and transcription.";
     $("#recording-time").textContent = "00:00:00";
     $("#recording-visual").parentElement.classList.remove("is-recording");
     $("#sidebar-status-dot").classList.remove("recording");
@@ -366,13 +392,16 @@
     try {
       const data = await apiRequest("/api/files");
       updateFiles(Array.isArray(data) ? data : data?.files);
-      toast("Recording saved. Converting the latest audio to Kannada.");
-      await autoTranscribeLatest();
+      const savedFile = state.files.find(file => file.name === savedFileName);
+      if (!savedFile) throw new Error("The saved recording is missing from the refreshed SD-card list.");
+      toast(`${savedFileName} saved to the SD card. Conversion is starting.`);
+      void transcribeFile(savedFile);
     } catch (error) {
       $("#recording-help").textContent = "Saved, but the latest recording could not be loaded.";
       toast(`Recording saved, but the file list could not be refreshed: ${error.message}`, true);
     } finally {
-      button.disabled = !state.connected;
+      state.controlBusy = false;
+      setConnected(state.connected, state.deviceInfo);
     }
   }
 
@@ -383,43 +412,42 @@
   async function autoTranscribeLatest() {
     const file = latestFile();
     if (!file) return;
-    const transcript = file.transcriptText || file.transcript || state.transcriptions.get(file.name);
-    if (typeof transcript === "string" && transcript.trim()) {
-      state.transcriptions.set(file.name, transcript);
-      await showLatestRecording(file, transcript);
-      return;
+    await transcribeFile(file);
+  }
+
+  function applyPlayback(file) {
+    const raw = $("#raw-audio"), clear = $("#enhanced-audio");
+    const rawUrl = deviceFileUrl(file.rawUrl || `/api/files/${encodeURIComponent(file.name)}/download`);
+    if (raw.src !== rawUrl) { raw.src = rawUrl; raw.load(); }
+    $("#raw-audio-label").textContent = file.selectedChannel
+      ? `Original microphone ${file.selectedChannel} of ${file.channels} ? No noise reduction`
+      : "Original SD-card audio";
+    $("#raw-channel-tag").textContent = file.channels ? `${file.channels} CH` : "RAW";
+    if (file.enhancedUrl) {
+      const clearUrl = deviceFileUrl(file.enhancedUrl);
+      if (clear.src !== clearUrl) { clear.src = clearUrl; clear.load(); }
+      clear.hidden = false;
+      $("#clear-audio-status").textContent = "Noise-reduced playback is ready. Compare it with the original.";
+    } else {
+      clear.pause(); clear.removeAttribute("src"); clear.load(); clear.hidden = true;
+      $("#clear-audio-status").textContent = "Clear audio will be available after audio processing.";
     }
-    await transcribeFile(file, 0);
+    $("#enhanced-audio-label").textContent = file.enhancement || "Noise reduction pending";
+    $("#enhancement-tag").textContent = file.enhancedUrl ? "PROCESSED" : "WAITING";
+    $("#latest-duration").textContent = file.durationSeconds ? `${file.durationSeconds.toFixed(1)} seconds` : file.duration || "?";
   }
 
   async function showLatestRecording(file, transcript = "") {
     if (!file) return;
     state.latestFile = file;
     $("#latest-result").hidden = false;
-    $("#latest-title").textContent = "Raw and enhanced audio";
-    $("#latest-filename").textContent = file.name || "Latest recording";
-    $("#raw-audio-label").textContent = `${file.channels || 4}-microphone array · Original audio`;
-    $("#enhanced-audio-label").textContent = file.enhancement || "Beamformed · Noise reduced";
-    $("#enhancement-tag").textContent = Number.isFinite(Number(file.snrGainDb))
-      ? `+${Number(file.snrGainDb).toFixed(1)} dB SNR`
-      : "ENHANCED";
-    $("#latest-duration").textContent = file.duration || "—";
-    const rawAudio = $("#raw-audio");
-    const enhancedAudio = $("#enhanced-audio");
-    rawAudio.hidden = false;
-    enhancedAudio.hidden = false;
-    rawAudio.src = deviceFileUrl(file.rawUrl || `/api/files/${encodeURIComponent(file.name)}/download`);
-    enhancedAudio.src = deviceFileUrl(file.enhancedUrl || `/api/files/${encodeURIComponent(file.name)}/enhanced`);
-    rawAudio.load();
-    enhancedAudio.load();
-    if (transcript) {
-      $("#latest-transcript-text").textContent = transcript;
-      setLatestStatus("Converted successfully to Kannada", "success");
-      $("#latest-title").textContent = "Converted successfully";
-    } else {
-      $("#latest-transcript-text").textContent = "Your complete Kannada transcript will appear here after conversion.";
-      setLatestStatus("Waiting for conversion", "waiting");
-    }
+    $("#latest-title").textContent = "Recording and transcript";
+    $("#latest-filename").textContent = file.name;
+    applyPlayback(file);
+    $("#latest-transcript-text").textContent = transcript || "Preparing this recording. Recognized speech will appear here.";
+    $("#copy-latest-transcript").disabled = !transcript;
+    $("#download-latest-transcript").disabled = !transcript;
+    setLatestStatus(transcript ? "Transcription ready ? review against the audio" : "Preparing recording", transcript ? "success" : "working");
   }
 
   function setLatestStatus(message, status) {
@@ -432,8 +460,8 @@
   }
 
   async function downloadFile(file) {
-    if (!state.connected) {
-      toast("Connect your ESP32 before downloading a file.", true);
+    if (!state.connected || state.recording) {
+      toast("Connect the ESP32 and stop recording before downloading a file.", true);
       return;
     }
     const link = document.createElement("a");
@@ -446,16 +474,20 @@
   }
 
   async function deleteFile(file) {
+    if (state.recording) { toast("Stop and save the active recording before deleting files.", true); return; }
     if (!window.confirm(`Delete "${file.name}" from the SD card? This cannot be undone.`)) return;
     try {
       await apiRequest(`/api/files/${encodeURIComponent(file.name)}`, { method: "DELETE" });
       updateFiles(state.files.filter((item) => item.name !== file.name));
-      state.transcriptions.delete(file.name);
+      for (const key of state.transcriptions.keys()) { if (key.startsWith(`${file.name}:`)) state.transcriptions.delete(key); }
       if (state.latestFile?.name === file.name) {
+        state.selection += 1;
         state.latestFile = null;
         $("#latest-result").hidden = true;
       }
-      toast("Recording deleted from the SD card.");
+      toast(`${file.name} deleted from the SD card.`);
+      const data = await apiRequest("/api/files");
+      updateFiles(Array.isArray(data) ? data : data?.files);
     } catch (error) {
       toast(error.message, true);
     }
@@ -486,7 +518,7 @@
       if (uploadedIndex === -1) {
         throw new Error("The upload was accepted, but the file is missing from the SD card list.");
       }
-      toast("Audio uploaded to the SD card. Starting Kannada conversion.");
+      toast("Audio uploaded to the SD card. Starting speech recognition.");
       await transcribeFile(state.files[uploadedIndex], uploadedIndex);
     } catch (error) {
       toast(error.message, true);
@@ -497,50 +529,55 @@
     }
   }
 
-  async function transcribeFile(file, index) {
-    const cachedText = file.transcriptText || file.transcript || state.transcriptions.get(file.name);
-    if (typeof cachedText === "string" && cachedText.trim()) {
-      state.transcriptions.set(file.name, cachedText);
-      setPage("overview");
-      await showLatestRecording(file, cachedText);
+  async function transcribeFile(file) {
+    if (!state.connected || state.recording || state.recordingPendingSave) {
+      toast("Connect the ESP32 and stop/save any active recording before converting.", true);
       return;
     }
-    if (!state.connected) {
-      toast("Connect your ESP32 before transcribing a recording.", true);
-      return;
-    }
-    const button = $("#library-files").rows[index]?.querySelector(".transcribe-action");
+    const selection = ++state.selection;
+    const key = `${file.name}:${file.size}`;
+    const selected = () => state.selection === selection && state.latestFile?.name === file.name && state.files.some(item => item.name === file.name);
     setPage("overview");
     await showLatestRecording(file);
-    setLatestStatus("Converting the complete audio to Kannada…", "working");
-    $("#latest-transcript-text").textContent = "Listening to the complete recording. Your Kannada transcript will appear here when conversion is finished.";
-    $("#latest-title").textContent = "Converting latest audio";
-    if (button) {
-      button.disabled = true;
-      button.setAttribute("aria-busy", "true");
-    }
+    const showProgress = result => {
+      if (!selected()) return;
+      if (result.audio) { Object.assign(file, result.audio); applyPlayback(file); }
+      if (result.message) setLatestStatus(result.message, "working");
+    };
     try {
-      const result = await apiRequest(`/api/files/${encodeURIComponent(file.name)}/transcribe`, { method: "POST" }, 30000);
-      let transcript = result;
-      if (result && typeof result === "object" && result.jobId) {
-        transcript = await waitForTranscript(result.jobId);
+      let result = state.transcriptions.get(key);
+      if (!result) {
+        let task = state.transcribing.get(key);
+        if (!task) {
+          task = (async () => {
+            const started = await apiRequest(`/api/files/${encodeURIComponent(file.name)}/transcribe`, { method: "POST" }, 30000);
+            return started.jobId ? waitForTranscript(started.jobId, progress => {
+              const active = state.transcribing.get(key);
+              active?.progress?.(progress);
+            }) : started;
+          })();
+          state.transcribing.set(key, task);
+          task.finally(() => state.transcribing.delete(key)).catch(() => {});
+        }
+        task.progress = showProgress;
+        result = await task;
+        if (!result?.text?.trim()) throw new Error("No reliable speech was recognized in this recording.");
+        if (!state.files.some(item => item.name === file.name)) return;
+        state.transcriptions.set(key, result);
       }
-      const text = typeof transcript === "string" ? transcript : transcript?.text;
-      if (typeof text !== "string" || !text.trim()) {
-        throw new Error("The transcription service returned no text.");
-      }
-      state.transcriptions.set(file.name, text);
-      await showLatestRecording(file, text);
-      updateFiles(state.files);
+      if (!selected()) return;
+      Object.assign(file, result.audio || {});
+      await showLatestRecording(file, result.text);
+      $("#transcript-language").textContent = "Kannada text";
+      $("#latest-transcript-text").lang = "kn";
+      setLatestStatus(result.warning || "Kannada text is ready. Compare it with the recording.", result.warning ? "waiting" : "success");
+      toast(result.warning ? `${file.name}: ${result.warning}` : `${file.name}: Kannada text and audio comparison ready.`, Boolean(result.warning));
     } catch (error) {
-      setLatestStatus("Conversion failed", "failed");
-      $("#latest-transcript-text").textContent = error.message;
-      $("#latest-title").textContent = "Conversion could not be completed";
-      toast(error.message, true);
-    } finally {
-      if (button) {
-        button.disabled = false;
-        button.removeAttribute("aria-busy");
+      if (selected()) {
+        setLatestStatus("Conversion could not produce reliable text", "failed");
+        $("#latest-transcript-text").textContent = error.message;
+        $("#latest-title").textContent = "Review this recording";
+        toast(`${file.name}: ${error.message}`, true);
       }
     }
   }
@@ -566,6 +603,8 @@
   function openDashboard() {
     state.recording = false;
     state.recordingPendingSave = false;
+    state.selection += 1;
+    window.clearInterval(state.timer);
     state.transcriptions.clear();
     setConnected(false);
     updateFiles([]);
@@ -601,12 +640,50 @@
     error.hidden = false;
   });
   $("#logout-button").addEventListener("click", () => {
+    state.selection += 1;
     state.connected = false;
     state.recording = false;
     state.recordingPendingSave = false;
     window.clearInterval(state.timer);
     showScreen("landing");
   });
+  let pollingDevice = false;
+  window.setInterval(async () => {
+    if (!state.connected || state.controlBusy || pollingDevice || screens.dashboard.hidden) return;
+    pollingDevice = true;
+    try {
+      const info = await apiRequest("/api/status");
+      const wasRecording = state.recording;
+      state.deviceInfo = info;
+      if (info.recording && !wasRecording) {
+        beginRecordingDisplay();
+        toast("Recording started on the hardware. LED: green.");
+      } else if (!info.recording && wasRecording) {
+        state.recording = false;
+        state.recordingPendingSave = false;
+        window.clearInterval(state.timer);
+        $("#recording-tag").classList.remove("recording");
+        $("#recording-tag").innerHTML = "<i></i> READY";
+        $("#recording-visual").parentElement.classList.remove("is-recording");
+        $("#sidebar-status-dot").classList.remove("recording");
+        if (info.recordingError || info.sdReady === false) {
+          $("#recording-help").textContent = "Recording stopped with an SD-card error. Check the red LED.";
+          toast("ESP32 stopped recording because of an SD-card error. The recording may be incomplete.", true);
+        } else {
+          const data = await apiRequest("/api/files");
+          updateFiles(Array.isArray(data) ? data : data?.files);
+          toast("Hardware recording stopped and saved. Loading the latest audio.");
+          void autoTranscribeLatest();
+        }
+      }
+      setConnected(true, info);
+      if (info.sdReady === false) {
+        $("#banner-message").textContent = "ESP32 connected, but the SD card is unavailable. Check the red LED and card.";
+      }
+    } catch { /* A streaming download can temporarily occupy the ESP32 HTTP server. */ }
+    finally { pollingDevice = false; }
+  }, 5000);
+
   $("#sync-button").addEventListener("click", syncDevice);
   $("#sidebar-connect").addEventListener("click", syncDevice);
   $("#library-sync").addEventListener("click", syncDevice);
@@ -635,7 +712,7 @@
   $("#copy-latest-transcript").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText($("#latest-transcript-text").textContent);
-      toast("Kannada transcript copied.");
+      toast("Transcript copied.");
     } catch {
       toast("Could not copy the transcript. Select and copy the text instead.", true);
     }
@@ -646,7 +723,7 @@
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${state.latestFile.name.replace(/\.[^.]+$/, "")}.kn.txt`;
+    link.download = `${state.latestFile.name.replace(/\.[^.]+$/, "")}.txt`;
     link.click();
     URL.revokeObjectURL(url);
   });

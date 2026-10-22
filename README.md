@@ -4,7 +4,7 @@ A dependency-free browser interface for an ESP32 audio recorder with an SD card.
 
 ## ESP32 firmware
 
-The Arduino sketch is [esp32_audio_studio.ino](./esp32_audio_studio.ino). It combines the supplied classic-ESP32/two-I2S/four-INMP441 recorder wiring with the website API: Wi-Fi/mDNS (`esp32.local`), WAV recording from the hardware button or dashboard, SD-card listing, audio uploads (up to 32 MB), download, and delete. Open it in Arduino IDE, select the original ESP32 board and port, copy `wifi_config.example.h` to `wifi_config.h`, set your Wi-Fi credentials there, and verify the pins at the top of the sketch, and upload. The SD-card SPI pins are VSPI defaults; each I2S microphone pair must share its bus clock, and one microphone must be strapped to the left channel and the other to the right channel. Open Serial Monitor at 115200 baud for initialization status.
+The Arduino sketch is [esp32_audio_studio.ino](./esp32_audio_studio/esp32_audio_studio.ino). It combines the supplied classic-ESP32/two-I2S/four-INMP441 recorder wiring with the website API: Wi-Fi/mDNS (`esp32.local`), WAV recording from the hardware button or dashboard, SD-card listing, audio uploads (up to 32 MB), download, and delete. Open the `esp32_audio_studio` folder in Arduino IDE, select the original ESP32 board and port, copy `wifi_config.example.h` to `wifi_config.h`, set your Wi-Fi credentials there, and verify the pins at the top of the sketch, and upload. The SD-card SPI pins are VSPI defaults; each I2S microphone pair must share its bus clock, and one microphone must be strapped to the left channel and the other to the right channel. Open Serial Monitor at 115200 baud for initialization status.
 
 The sketch writes four-channel, 16 kHz, 16-bit WAV files. Kannada transcription runs on the PC through the local Python server and Whisper. Direct transcription requests to the ESP32 still return HTTP 501. Beamforming/noise-reduced audio is not implemented. The sketch uses the legacy ESP32 I2S driver and the GPIO mapping from the provided old sketch; verify the wiring and installed ESP32 Arduino core for your exact board before uploading.
 
@@ -42,12 +42,16 @@ If Windows cannot resolve `esp32.local`, run `.\.venv\Scripts\python.exe studio_
 
 The local server discovers `esp32.local` using mDNS queries requesting unicast replies on the computer's IPv4 interfaces. It caches the discovered address for at most 30 seconds and forwards the studio's API and audio requests to that recorder. No device IP is entered or hard-coded. This works around the observed Windows multicast-response failure; it does not repair Windows-wide `.local` name resolution. The server listens only on this computer and serves only the studio assets. The ESP32 and computer must remain on the same local network.
 
-## Local Kannada transcription with Whisper
+## Local Kannada text with Whisper and NLLB
 
 Double-click `start_studio.cmd`, or run `.\.venv\Scripts\python.exe studio_server.py --open`. Use the local page at http://localhost:8765; direct ESP32 requests cannot run Whisper. For a new installation, run `python -m venv .venv` and `.\.venv\Scripts\python.exe -m pip install -r requirements.txt` first.
 
-Convert downloads the complete selected audio through the mDNS-discovered ESP32 and runs the multilingual `small` Whisper model locally, using CPU int8 inference with Kannada (`kn`) and `transcribe` selected. Four-channel recordings are decoded and mixed down by the audio decoder. No audio is uploaded to a cloud service. Initial model installation requires internet access; downloaded model files stay in `.models`. Recognition quality depends on the model and recording quality; verify important text against the audio.
+Convert downloads the complete selected audio through the mDNS-discovered ESP32 and runs multilingual Whisper locally. It automatically identifies and recognizes the spoken language, then renders the recognized words in Kannada script without changing their meaning. For example, “good morning” is rendered phonetically as Kannada-script speech, rather than translated as “ಶುಭೋದಯ”. There is no language selector in the webpage. Kannada speech remains Kannada; English is rendered phonetically; recognized Hindi, Tamil, Telugu, Malayalam and related Indic scripts are transliterated to Kannada. No audio or transcript is uploaded to a cloud service. Verify important text against the audio.
 
 One conversion runs at a time, with up to four active/queued jobs. The page polls for progress. Recordings up to 512 MB can be converted. Temporary audio is deleted after conversion. Transcripts are cached in `.transcripts`, keyed by audio content and model, so later conversions can reuse results without mixing up files that share a filename. These folders are private local runtime data and excluded from Git. Failed jobs show a readable error and can be retried.
 
-To use a larger multilingual model, set `$env:WHISPER_MODEL="medium"` before starting the server. It requires a larger download and more processing time. Do not select an English-only `.en` model for Kannada. Audio enhancement/beamforming remains unimplemented; local Whisper adds transcription only.
+The default Whisper model is `medium`; it is more accurate than the earlier `small` model but slower on CPU. Do not select an English-only `.en` model. The Clear audio player uses a selected microphone channel and local noise reduction. It is not beamforming.
+
+## WS2812 status LED
+
+One WS2812 RGB LED is connected to GPIO 4. The firmware shows red when the SD card is unavailable or a recording write fails, blue when the recorder is ready, and green while it is recording.

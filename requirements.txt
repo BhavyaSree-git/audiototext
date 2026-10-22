@@ -1,2 +1,5 @@
 faster-whisper>=1.2,<2
 av>=11,<17
+scipy>=1.13,<2
+eng-to-ipa>=0.0.2,<1
+aksharamukha>=2.3,<3

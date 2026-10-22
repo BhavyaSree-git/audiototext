@@ -1,11 +1,13 @@
 #include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+#include <Preferences.h>
 #include <ESPmDNS.h>
 #include <FS.h>
 #include <SD.h>
 #include <SPI.h>
 #include <WebServer.h>
 #include <WiFi.h>
-#include "driver/i2s.h"a
+#include "driver/i2s.h"
 
 // Tested pin assumptions from the supplied sketch: original ESP32 DevKit,
 // two I2S controllers, four INMP441 microphones, and an SPI SD-card module.
@@ -19,7 +21,10 @@ static constexpr int SD_MISO = 19;
 static constexpr int SD_MOSI = 23;
 
 static constexpr int BUTTON_PIN = 27;
-static constexpr int STATUS_LED = 2;
+static constexpr int WS2812_PIN = 4;
+static constexpr int WS2812_COUNT = 1;
+Adafruit_NeoPixel statusPixel(WS2812_COUNT, WS2812_PIN, NEO_GRB + NEO_KHZ800);
+Preferences recorderPreferences;
 
 static constexpr int I2S0_BCLK = 26;
 static constexpr int I2S0_WS = 25;
@@ -53,6 +58,31 @@ bool sdReady = false;
 bool i2sReady = false;
 bool recording = false;
 bool mdnsStarted = false;
+bool lastRecordingSaved = false;
+bool recordingWriteFailed = false;
+uint32_t recordingStartedMs = 0;
+
+void updateStatusLed() {
+  static uint32_t previousColor = 0xFFFFFFFF;
+  const uint32_t color = (!sdReady || recordingWriteFailed) ? statusPixel.Color(64, 0, 0)
+      : recording ? statusPixel.Color(0, 64, 0)
+      : i2sReady ? statusPixel.Color(0, 0, 64) : statusPixel.Color(64, 32, 0);
+  if (color != previousColor) {
+    statusPixel.setPixelColor(0, color);
+    statusPixel.show();
+    previousColor = color;
+  }
+}
+
+void markSdError() {
+  sdReady = false;
+  updateStatusLed();
+}
+
+void rememberSavedFile() {
+  recorderPreferences.putString("latest", lastFinishedFile);
+}
+
 
 void sendCorsHeaders() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -124,6 +154,7 @@ String pathForName(const String &name) {
 }
 
 bool isAudioFile(const String &filename) {
+  if (filename.startsWith("._") || filename.startsWith(".")) return false;
   String lower = filename;
   lower.toLowerCase();
   return lower.endsWith(".wav") || lower.endsWith(".mp3") ||
@@ -246,22 +277,22 @@ bool installI2S(i2s_port_t port, int bclkPin, int wsPin, int dataPin) {
   return true;
 }
 
-void writeLE16(File &file, uint16_t value) {
+bool writeLE16(File &file, uint16_t value) {
   const uint8_t bytes[2] = {
     static_cast<uint8_t>(value & 0xFF),
     static_cast<uint8_t>((value >> 8) & 0xFF)
   };
-  file.write(bytes, sizeof(bytes));
+  return file.write(bytes, sizeof(bytes)) == sizeof(bytes);
 }
 
-void writeLE32(File &file, uint32_t value) {
+bool writeLE32(File &file, uint32_t value) {
   const uint8_t bytes[4] = {
     static_cast<uint8_t>(value & 0xFF),
     static_cast<uint8_t>((value >> 8) & 0xFF),
     static_cast<uint8_t>((value >> 16) & 0xFF),
     static_cast<uint8_t>((value >> 24) & 0xFF)
   };
-  file.write(bytes, sizeof(bytes));
+  return file.write(bytes, sizeof(bytes)) == sizeof(bytes);
 }
 
 bool writeWavHeader(File &file, uint32_t dataSize) {
@@ -270,18 +301,18 @@ bool writeWavHeader(File &file, uint32_t dataSize) {
   if (!file.seek(0)) return false;
 
   bool ok = file.write(reinterpret_cast<const uint8_t *>("RIFF"), 4) == 4;
-  writeLE32(file, 36 + dataSize);
+  ok &= writeLE32(file, 36 + dataSize);
   ok &= file.write(reinterpret_cast<const uint8_t *>("WAVE"), 4) == 4;
   ok &= file.write(reinterpret_cast<const uint8_t *>("fmt "), 4) == 4;
-  writeLE32(file, 16);
-  writeLE16(file, 1);
-  writeLE16(file, CHANNELS);
-  writeLE32(file, SAMPLE_RATE);
-  writeLE32(file, byteRate);
-  writeLE16(file, blockAlign);
-  writeLE16(file, BITS_PER_SAMPLE);
+  ok &= writeLE32(file, 16);
+  ok &= writeLE16(file, 1);
+  ok &= writeLE16(file, CHANNELS);
+  ok &= writeLE32(file, SAMPLE_RATE);
+  ok &= writeLE32(file, byteRate);
+  ok &= writeLE16(file, blockAlign);
+  ok &= writeLE16(file, BITS_PER_SAMPLE);
   ok &= file.write(reinterpret_cast<const uint8_t *>("data"), 4) == 4;
-  writeLE32(file, dataSize);
+  ok &= writeLE32(file, dataSize);
   return ok;
 }
 
@@ -309,11 +340,12 @@ bool startRecording() {
   if (filename.isEmpty()) return false;
 
   wavFile = SD.open(filename, FILE_WRITE);
-  if (!wavFile) return false;
+  if (!wavFile) { markSdError(); return false; }
   const uint8_t blankHeader[44] = {};
   if (wavFile.write(blankHeader, sizeof(blankHeader)) != sizeof(blankHeader)) {
     wavFile.close();
     SD.remove(filename);
+    markSdError();
     return false;
   }
 
@@ -322,7 +354,10 @@ bool startRecording() {
   audioBytesWritten = 0;
   currentRecordingPath = filename;
   recording = true;
-  digitalWrite(STATUS_LED, HIGH);
+  lastRecordingSaved = false;
+  recordingWriteFailed = false;
+  recordingStartedMs = millis();
+  updateStatusLed();
   Serial.println("[REC] Started: " + filename);
   return true;
 }
@@ -334,19 +369,26 @@ void stopRecording(bool drainAudio = true) {
     if (!recording) return;
   }
   recording = false;
-  digitalWrite(STATUS_LED, LOW);
+  updateStatusLed();
 
   if (wavFile) {
     wavFile.flush();
     if (!writeWavHeader(wavFile, audioBytesWritten)) {
-      Serial.println("[REC] Warning: WAV header update failed.");
+      Serial.println("[REC] WAV header update failed.");
+      recordingWriteFailed = true;
+      markSdError();
     }
     wavFile.flush();
     wavFile.close();
   }
 
-  lastFinishedFile = currentRecordingPath;
+  lastRecordingSaved = !recordingWriteFailed;
+  if (lastRecordingSaved) {
+    lastFinishedFile = currentRecordingPath;
+    rememberSavedFile();
+  }
   currentRecordingPath = "";
+  updateStatusLed();
   const float duration = static_cast<float>(audioBytesWritten) /
       (SAMPLE_RATE * CHANNELS * (BITS_PER_SAMPLE / 8));
   Serial.printf("[REC] Saved %s (%.2f s, %lu bytes)\n",
@@ -387,6 +429,8 @@ void captureAudio() {
   audioBytesWritten += written;
   if (written != requested) {
     Serial.println("[REC] SD write failed; stopping recording.");
+    recordingWriteFailed = true;
+    markSdError();
     stopRecording(false);
   }
 }
@@ -397,7 +441,11 @@ void handleStatus() {
       String(recording ? "true" : "false") + ",\"storage\":{\"used\":" +
       String(sdReady ? SD.usedBytes() : 0) + ",\"total\":" + String(sdReady ? SD.totalBytes() : 0) +
       "},\"sdReady\":" + String(sdReady ? "true" : "false") + ",\"sampleRate\":" + String(SAMPLE_RATE) + ",\"channels\":" +
-      String(CHANNELS) + ",\"mdns\":\"http://esp32.local\"}";
+      String(CHANNELS) + ",\"i2sReady\":" + String(i2sReady ? "true" : "false") +
+      ",\"recordingMs\":" + String(recording ? millis() - recordingStartedMs : 0) +
+      ",\"lastSavedFile\":\"" + jsonEscape(lastFinishedFile.substring(1)) +
+      "\",\"recordingError\":" + String(recordingWriteFailed ? "true" : "false") +
+      ",\"mdns\":\"http://esp32.local\"}";
   sendJson(200, body);
 }
 
@@ -414,7 +462,8 @@ void handleFiles() {
   File root = SD.open("/");
   if (!root || !root.isDirectory()) {
     if (root) root.close();
-    sendJson(500, "{\"error\":\"Could not open the SD-card root directory.\"}");
+    markSdError();
+    sendJson(500, "{\"error\":\"Could not open the SD-card root directory. Check the SD card.\"}");
     return;
   }
 
@@ -502,10 +551,15 @@ void handleFileDelete(const String &filename) {
     return;
   }
   if (!SD.remove(path)) {
+    markSdError();
     sendJson(500, "{\"error\":\"Could not delete the audio file.\"}");
     return;
   }
-  if (lastFinishedFile == path) lastFinishedFile = "";
+  if (lastFinishedFile == path) {
+    lastFinishedFile = "";
+    lastFinishedFile = findLatestRecording();
+    rememberSavedFile();
+  }
   sendJson(200, "{\"deleted\":true}");
 }
 
@@ -535,7 +589,7 @@ void handleUploadData() {
         return;
       }
       uploadFile = SD.open(uploadPath, FILE_WRITE);
-      if (!uploadFile) uploadError = "Could not create the uploaded file on the SD card.";
+      if (!uploadFile) { uploadError = "Could not create the uploaded file on the SD card."; markSdError(); }
       break;
 
     case UPLOAD_FILE_WRITE:
@@ -550,6 +604,7 @@ void handleUploadData() {
       if (!uploadFile ||
           uploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
         uploadError = "Could not write the complete upload to the SD card.";
+        markSdError();
         if (uploadFile) uploadFile.close();
         SD.remove(uploadPath);
       }
@@ -589,6 +644,7 @@ void handleUploadComplete() {
   }
   const String name = uploadPath.substring(1);
   lastFinishedFile = uploadPath;
+  rememberSavedFile();
   sendJson(201, "{\"name\":\"" + jsonEscape(name) + "\"}");
   uploadPath = "";
 }
@@ -615,11 +671,13 @@ void handleStartRecord() {
 }
 
 void handleStopRecord() {
+  if (recordingWriteFailed) { sendJson(500, "{\"error\":\"Recording stopped because SD writing failed. Check the red LED and SD card.\"}"); return; }
   if (!recording) {
     sendJson(200, "{\"recording\":false,\"message\":\"No active recording.\"}");
     return;
   }
   stopRecording();
+  if (!lastRecordingSaved) { sendJson(500, "{\"error\":\"Recording could not be saved completely. Check the SD card.\"}"); return; }
   sendJson(200, "{\"recording\":false,\"saved\":true,\"file\":\"" +
            jsonEscape(lastFinishedFile.substring(1)) + "\",\"bytes\":" +
            String(audioBytesWritten) + "}");
@@ -634,7 +692,7 @@ void handleSaveRecord() {
     sendJson(409, "{\"error\":\"Stop the recording before saving it.\"}");
     return;
   }
-  if (lastFinishedFile.isEmpty() || !SD.exists(lastFinishedFile)) {
+  if (!lastRecordingSaved || recordingWriteFailed || lastFinishedFile.isEmpty() || !SD.exists(lastFinishedFile)) {
     sendJson(404, "{\"error\":\"There is no stopped recording to save.\"}");
     return;
   }
@@ -741,8 +799,9 @@ void setupRoutes() {
 void setup() {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(STATUS_LED, OUTPUT);
-  digitalWrite(STATUS_LED, LOW);
+  statusPixel.begin();
+  updateStatusLed();
+  recorderPreferences.begin("audio-studio", false);
   Serial.println("\nESP32 four-microphone audio studio");
 
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -757,7 +816,11 @@ void setup() {
   Serial.println(i2sReady ? "Both I2S microphone buses ready."
                           : "I2S initialization failed; check board core and microphone wiring.");
 
-  if (sdReady) lastFinishedFile = findLatestRecording();
+  if (sdReady) {
+    lastFinishedFile = recorderPreferences.getString("latest", "");
+    lastFinishedFile = findLatestRecording();
+  }
+  updateStatusLed();
 
   connectWifi();
   startMdns();
@@ -769,6 +832,19 @@ void loop() {
   handleButton();
   if (recording) captureAudio();
 
+  static uint32_t lastSdCheckMs = 0;
+  if (!recording && millis() - lastSdCheckMs >= 5000) {
+    lastSdCheckMs = millis();
+    if (sdReady) {
+      File probe = SD.open("/");
+      if (!probe || !probe.isDirectory()) markSdError();
+      if (probe) probe.close();
+    } else {
+      SD.end();
+      sdReady = SD.begin(SD_CS, sdSPI, 10000000);
+      updateStatusLed();
+    }
+  }
   static uint32_t lastWifiCheckMs = 0;
   static bool wasConnected = WiFi.status() == WL_CONNECTED;
   if (millis() - lastWifiCheckMs >= 4000) {

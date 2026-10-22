@@ -7,3 +7,6 @@ wifi_config.h
 .env
 .env.*
 !.env.example
+.audio-check/
+.processed/
+.build/

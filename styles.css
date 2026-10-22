@@ -19,3 +19,5 @@
 @media(max-width:420px){.library-actions{gap:5px}.library-actions .button{font-size:9px;padding:8px}.upload-help{line-height:1.5}}
 
 #connection-error{font-size:12px;line-height:1.6;color:#873f30;overflow-wrap:anywhere;margin:10px 0}
+
+#clear-audio-status{font-size:11px;line-height:1.5;color:#58645a}

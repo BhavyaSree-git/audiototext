@@ -4,13 +4,14 @@ import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import re
 from pathlib import Path
 import select
 import socket
 import struct
 import threading
 import time
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urlsplit, unquote, parse_qs
 import webbrowser
 from local_transcription import TranscriptionJobs
 
@@ -150,6 +151,9 @@ class StudioHandler(BaseHTTPRequestHandler):
             self.reply(403, b"Open the local studio to control the recorder", "text/plain")
             return
         path = urlsplit(self.path).path
+        if path.startswith("/api/audio/") and self.command == "GET":
+            self.serve_audio(path)
+            return
         if path.startswith("/api/transcriptions/") and self.command == "GET":
             job = transcriptions.get(path.rsplit("/", 1)[-1])
             self.reply(200 if job else 404, json.dumps(job or {"error": "Conversion job not found. Click Convert again."}).encode(), "application/json")
@@ -174,6 +178,52 @@ class StudioHandler(BaseHTTPRequestHandler):
         if name == "index.html":
             body = body.replace(b"<head>", b"<head><script>window.STUDIO_MDNS_PROXY = true;</script>", 1)
         self.reply(200, body, content_type)
+
+    def serve_audio(self, path):
+        match = re.fullmatch(r"/api/audio/([a-f0-9]{64})/(raw|clear)\.wav", path)
+        if not match:
+            self.reply(404, b"Audio not found", "text/plain")
+            return
+        file = ROOT / ".processed" / match[1] / f"{match[2]}.wav"
+        if not file.is_file():
+            self.reply(404, b"Convert this recording to prepare playback", "text/plain")
+            return
+        size = file.stat().st_size
+        start, end, status = 0, size - 1, 200
+        requested = self.headers.get("Range")
+        if requested:
+            parts = re.fullmatch(r"bytes=(\d*)-(\d*)", requested)
+            if not parts or not any(parts.groups()):
+                self.reply(416, b"Invalid audio range", "text/plain")
+                return
+            if parts[1]:
+                start = int(parts[1])
+                end = min(int(parts[2]), size - 1) if parts[2] else size - 1
+            else:
+                start = max(0, size - int(parts[2]))
+            if start > end or start >= size:
+                self.reply(416, b"Audio range is outside the file", "text/plain")
+                return
+            status = 206
+        self.send_response(status)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        try:
+            with file.open("rb") as audio:
+                audio.seek(start)
+                remaining = end - start + 1
+                while remaining:
+                    chunk = audio.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def proxy(self):
         connection = None
