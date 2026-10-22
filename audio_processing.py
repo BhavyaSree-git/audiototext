@@ -39,7 +39,7 @@ def decode_channels(path):
     return np.concatenate(pieces, axis=1).astype(np.float32)
 
 
-def prepare_audio(source, raw_path, clear_path):
+def prepare_audio(source, raw_path, clear_path, preferred_channel=None):
     channels = decode_channels(source)
     sos = signal.butter(3, [80, 7600], btype="bandpass", fs=RATE, output="sos")
     best = None
@@ -62,8 +62,17 @@ def prepare_audio(source, raw_path, clear_path):
         score = float(20 * np.log10((speech + 1e-7) / (noise + 1e-7)) - clipping * 100)
         if best is None or score > best[0]:
             best = (score, index, normalized)
+    # A Whisper retry can request a particular microphone.  This is useful when a
+    # distant but quiet speaker is clearer than the channel with the best VAD SNR.
+    if preferred_channel is not None:
+        index = int(preferred_channel)
+        if index < 0 or index >= len(channels):
+            raise ValueError("Requested microphone channel is not available.")
+        normalized = signal.sosfilt(sos, channels[index]).astype(np.float32)
+        peak = float(np.quantile(np.abs(normalized), .999))
+        normalized *= min(8.0, .85 / max(peak, .0001))
     # Still produce playable audio when speech is absent. Recognition is gated below.
-    if best is None:
+    elif best is None:
         index = int(np.argmax(np.mean(channels ** 2, axis=1)))
         normalized = signal.sosfilt(sos, channels[index]).astype(np.float32)
     else:
@@ -89,6 +98,8 @@ def prepare_audio(source, raw_path, clear_path):
     write_wav(clear_path, clear)
     spans = get_speech_timestamps(normalized, VadOptions(threshold=.55, min_speech_duration_ms=250, min_silence_duration_ms=400))
     speech_seconds = sum(s["end"] - s["start"] for s in spans) / RATE
+    loudest_channel = int(np.argmax(np.mean(channels ** 2, axis=1))) + 1
     return normalized, {"channels": int(channels.shape[0]), "selectedChannel": index + 1,
+                        "loudestChannel": loudest_channel,
                         "durationSeconds": len(clear) / RATE, "speechSeconds": speech_seconds,
                         "enhancement": "Selected microphone · Noise reduced"}
